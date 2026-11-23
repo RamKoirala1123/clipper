@@ -82,12 +82,14 @@ def library():
  records=[]
  groups=app.reedit_groups()
  for f in DATA.glob('*.json'):
-  if f.name.endswith(('.state.json','.request.json','.words.json')):continue
+  if f.name.endswith(('.state.json','.request.json','.words.json')) or f.name.startswith(('social_','llm.','donate.')):continue
   try:
-   j=json.loads(f.read_text());result=j.get('result',{})
+   j=json.loads(f.read_text())
+   if not isinstance(j,dict):continue
+   result=j.get('result',{})
    if result.get('status')=='done' and not j.get('superseded_by') and (DATA/(f.stem+'.mp4')).exists():
     records.append({'id':f.stem,'title':j.get('settings',{}).get('title') or 'NeonClipping clip','created':f.stat().st_mtime,'meta':result.get('meta',{}),'settings':j.get('settings',{}),'srt':bool(result.get('srt')) and (DATA/(f.stem+'.srt')).exists(),**app.reedit_metadata(f.stem,j,groups)})
-  except (ValueError,OSError):pass
+  except Exception:pass
  return sorted(records,key=lambda j:j['created'],reverse=True)
 
 def source_range(b):

@@ -43,11 +43,12 @@ def ancestors(data, file):
     while todo:
         cur=todo.pop()
         for path in data.glob('*.json'):
-            if path.name.endswith(('.state.json','.words.json','.request.json')):continue
+            if path.name.endswith(('.state.json','.words.json','.request.json')) or path.name.startswith(('social_','llm.','donate.')):continue
             try:
-                if json.loads(path.read_text(encoding='utf-8')).get('superseded_by')==cur and path.stem not in out:
+                j = json.loads(path.read_text(encoding='utf-8'))
+                if isinstance(j, dict) and j.get('superseded_by')==cur and path.stem not in out:
                     out.append(path.stem);todo.append(path.stem)
-            except (OSError,ValueError):pass
+            except Exception:pass
     return out
 
 def read_record(data, file):

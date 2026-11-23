@@ -15,7 +15,7 @@ DATA = Path(os.environ.get("NEONCLIPPING_DATA_DIR", str(ROOT / "data"))).resolve
 DATA.mkdir(parents=True, exist_ok=True)
 
 _lock = threading.RLock()
-_FILE = DATA / "social_posts.json"
+_FILE = social_accounts.SOCIAL_DIR / "posts.json"
 
 
 def _read_posts() -> list:
@@ -262,6 +262,7 @@ def attach(app, data):
         return social_accounts.list_accounts()
 
     @app.delete("/api/accounts/{aid}")
+    @app.post("/api/accounts/{aid}/delete")
     def delete_account(aid: str):
         social_accounts.remove_account(aid)
         return {"ok": True}

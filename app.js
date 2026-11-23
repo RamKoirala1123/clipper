@@ -378,7 +378,7 @@ async function refreshSocialAccounts() {
       del.onclick = async () => {
         if (!confirm('Disconnect ' + acc.name + ' (' + acc.platform + ')?')) return;
         try {
-          await request('/api/accounts/' + acc.id, undefined);
+          await request('/api/accounts/' + acc.id + '/delete', {});
           await refreshSocialAccounts();
           status('Account disconnected.');
         } catch (e) {

@@ -18,7 +18,20 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("NEONCLIPPING_DATA_DIR", str(ROOT / "data"))).resolve()
-DATA.mkdir(parents=True, exist_ok=True)
+SOCIAL_DIR = DATA / "social"
+SOCIAL_DIR.mkdir(parents=True, exist_ok=True)
+
+# Migrate legacy top-level files if present
+for _name in ("social_accounts.json", "social_apps.json", "social_posts.json"):
+    _old = DATA / _name
+    if _old.exists():
+        try:
+            _target = SOCIAL_DIR / (_name.replace("social_", ""))
+            if not _target.exists():
+                _target.write_text(_old.read_text(encoding="utf-8"), encoding="utf-8")
+            _old.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 _lock = threading.RLock()
 _states: dict = {}  # state -> (created_at, platform)
@@ -97,11 +110,11 @@ def _check(code, text, what):
 
 # ------------------------------------------------------------------ Persistence
 def _accounts_file() -> Path:
-    return DATA / "social_accounts.json"
+    return SOCIAL_DIR / "accounts.json"
 
 
 def _apps_file() -> Path:
-    return DATA / "social_apps.json"
+    return SOCIAL_DIR / "apps.json"
 
 
 def _read_json(p: Path, default):

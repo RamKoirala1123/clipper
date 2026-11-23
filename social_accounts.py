@@ -675,50 +675,97 @@ def youtube_upload(acc: dict, video_path: Path, title: str, description: str, ta
     return vid, url
 
 
-def facebook_upload(acc: dict, video_path: Path, title: str, description: str, is_reel: bool = True) -> tuple:
-    """Uploads video or Reel to Facebook Page via Meta Graph API.
+def facebook_upload(acc: dict, video_path: Path, title: str, description: str, is_reel: bool = True, progress_cb=None) -> tuple:
+    """Uploads video or Reel to Facebook Page via Meta Graph API using chunked Resumable Upload.
+    Handles files of any size (even hundreds of megabytes) reliably without HTTP 413 errors.
     Returns (video_id, post_url).
     """
     token = acc.get("access_token", "")
     page_id = acc.get("page_id") or "me"
     size = video_path.stat().st_size
-
-    # Multipart boundary upload
-    boundary = "----NeonClippingBoundary" + secrets.token_hex(8)
     clean_title = (title or "Clip")[:100]
     clean_desc = (description or "")[:5000]
 
+    # Phase 1: Start upload session
+    start_url = f"https://graph.facebook.com/v21.0/{page_id}/videos"
+    start_data = urllib.parse.urlencode({
+        "upload_phase": "start",
+        "file_size": str(size),
+        "access_token": token
+    }).encode("utf-8")
+
+    st, _, _, text = _http_request(start_url, method="POST", data=start_data, timeout=60)
+    res_start = _check(st, text, "Starting Facebook Video Upload Session")
+
+    video_id = str(res_start.get("video_id") or "")
+    session_id = str(res_start.get("upload_session_id") or "")
+    start_offset = int(res_start.get("start_offset") or 0)
+    end_offset = int(res_start.get("end_offset") or min(start_offset + 4 * 1024 * 1024, size))
+
+    if not session_id:
+        raise RuntimeError("Facebook did not return an upload_session_id.")
+
+    # Phase 2: Transfer chunks (4MB per chunk)
+    chunk_size = 4 * 1024 * 1024
+    transfer_url = f"https://graph-video.facebook.com/v21.0/{page_id}/videos"
+
     with video_path.open("rb") as f:
-        video_content = f.read()
+        while start_offset < size:
+            target_end = min(start_offset + chunk_size, size)
+            f.seek(start_offset)
+            chunk_bytes = f.read(target_end - start_offset)
 
-    body = bytearray()
-    def add_field(name, val):
-        body.extend(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{val}\r\n".encode("utf-8"))
+            boundary = "----NeonFBChunk" + secrets.token_hex(8)
+            body = bytearray()
+            def add_field(n, v):
+                body.extend(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{n}\"\r\n\r\n{v}\r\n".encode("utf-8"))
 
-    add_field("access_token", token)
-    add_field("title", clean_title)
-    add_field("description", clean_desc)
-    if is_reel:
-        add_field("published", "true")
+            add_field("upload_phase", "transfer")
+            add_field("upload_session_id", session_id)
+            add_field("start_offset", str(start_offset))
+            add_field("access_token", token)
+            body.extend(f"--{boundary}\r\nContent-Disposition: form-data; name=\"video_file_chunk\"; filename=\"chunk.mp4\"\r\nContent-Type: application/octet-stream\r\n\r\n".encode("utf-8"))
+            body.extend(chunk_bytes)
+            body.extend(f"\r\n--{boundary}--\r\n".encode("utf-8"))
 
-    body.extend(
-        f"--{boundary}\r\nContent-Disposition: form-data; name=\"source\"; filename=\"{video_path.name}\"\r\nContent-Type: video/mp4\r\n\r\n".encode("utf-8")
-    )
-    body.extend(video_content)
-    body.extend(f"\r\n--{boundary}--\r\n".encode("utf-8"))
+            st, _, _, text = _http_request(
+                transfer_url,
+                method="POST",
+                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+                data=bytes(body),
+                timeout=300
+            )
+            res_transfer = _check(st, text, f"Uploading video chunk at offset {start_offset}")
 
-    endpoint = f"https://graph-video.facebook.com/v21.0/{page_id}/videos"
-    st, _, _, text = _http_request(
-        endpoint,
-        method="POST",
-        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-        data=bytes(body),
-        timeout=1800,
-    )
-    res = _check(st, text, "Uploading video to Facebook")
-    vid = str(res.get("id") or "")
-    url = f"https://www.facebook.com/{page_id}/videos/{vid}" if (vid and page_id != "me") else f"https://www.facebook.com/{vid}"
-    return vid, url
+            new_start = int(res_transfer.get("start_offset", target_end))
+            if new_start <= start_offset:
+                start_offset = target_end
+            else:
+                start_offset = new_start
+
+            if progress_cb and size > 0:
+                pct = min(99, int((start_offset / size) * 100))
+                progress_cb(pct)
+
+    # Phase 3: Finish upload session
+    finish_url = f"https://graph.facebook.com/v21.0/{page_id}/videos"
+    finish_params = {
+        "upload_phase": "finish",
+        "upload_session_id": session_id,
+        "title": clean_title,
+        "description": clean_desc,
+        "published": "true" if is_reel else "false",
+        "access_token": token
+    }
+    finish_data = urllib.parse.urlencode(finish_params).encode("utf-8")
+    st, _, _, text = _http_request(finish_url, method="POST", data=finish_data, timeout=60)
+    _check(st, text, "Finishing Facebook Video Upload")
+
+    if progress_cb:
+        progress_cb(100)
+
+    url = f"https://www.facebook.com/{page_id}/videos/{video_id}" if (video_id and page_id != "me") else f"https://www.facebook.com/{video_id}"
+    return video_id, url
 
 
 def tiktok_upload(acc: dict, video_path: Path, caption: str, privacy: str = "public") -> tuple:

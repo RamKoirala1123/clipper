@@ -102,6 +102,10 @@ def execute_post(p: dict):
     privacy = p.get("privacy") or "public"
 
     try:
+        def on_progress(pct: int):
+            p["progress"] = f"{pct}%"
+            _save_post_update(p)
+
         plat = acc["platform"]
         if plat == "youtube":
             remote_id, url = social_accounts.youtube_upload(
@@ -109,7 +113,7 @@ def execute_post(p: dict):
             )
         elif plat == "facebook":
             remote_id, url = social_accounts.facebook_upload(
-                acc, video_path, title, desc, is_reel=True
+                acc, video_path, title, desc, is_reel=True, progress_cb=on_progress
             )
         elif plat == "tiktok":
             caption = f"{title}\n\n{desc}".strip()
@@ -125,6 +129,7 @@ def execute_post(p: dict):
             raise RuntimeError(f"Platform {plat} is not supported.")
 
         p["status"] = "posted"
+        p["progress"] = "100%"
         p["posted_at"] = time.time()
         p["remote_id"] = remote_id
         p["post_url"] = url

@@ -567,8 +567,8 @@ async function submitPost(isNow) {
       return;
     }
 
-    // Poll status of this clip's posts
-    for (let i = 0; i < 40; i++) {
+    // Poll status of this clip's posts (up to 6 minutes for large files)
+    for (let i = 0; i < 180; i++) {
       await sleep(2000);
       const posts = await request('/api/posts?clip_id=' + activePostClip);
       const myPosts = posts.filter(p => checked.includes(p.account_id));
@@ -576,6 +576,11 @@ async function submitPost(isNow) {
 
       const anyPosting = myPosts.some(p => p.status === 'posting' || p.status === 'scheduled');
       const allDone = myPosts.every(p => p.status === 'posted' || p.status === 'failed');
+
+      if (anyPosting) {
+        const prog = myPosts.map(p => p.progress).filter(Boolean)[0];
+        banner.textContent = 'Uploading to ' + checked.length + ' account(s)...' + (prog ? ' (' + prog + ')' : '');
+      }
 
       if (allDone || !anyPosting) {
         const successes = myPosts.filter(p => p.status === 'posted');

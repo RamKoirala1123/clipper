@@ -100,12 +100,21 @@ def _http_request(url, method="GET", headers=None, data=None, json_data=None, ti
 
 
 def _check(code, text, what):
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict) and "error" in data:
+            err = data["error"]
+            msg = err.get("message") if isinstance(err, dict) else str(err)
+            c = err.get("code") if isinstance(err, dict) else ""
+            sc = err.get("error_subcode") if isinstance(err, dict) else ""
+            extra = f" (code {c}, subcode {sc})" if (c or sc) else ""
+            raise RuntimeError(f"{what} failed: {msg}{extra}")
+    except json.JSONDecodeError:
+        data = None
+
     if code >= 400:
         raise RuntimeError(f"{what} failed ({code}): {text[:350]}")
-    try:
-        return json.loads(text)
-    except Exception:
-        return text
+    return data if data is not None else text
 
 
 # ------------------------------------------------------------------ Persistence
@@ -612,8 +621,8 @@ def _finish_instagram(code: str) -> dict:
 
 
 # ------------------------------------------------------------------ Direct Upload Functions
-def youtube_upload(acc: dict, video_path: Path, title: str, description: str, tags: list = None, privacy: str = "public") -> tuple:
-    """Uploads a video / Short to YouTube using the v3 Resumable Upload API.
+def youtube_upload(acc: dict, video_path: Path, title: str, description: str, tags: list = None, privacy: str = "public", progress_cb=None) -> tuple:
+    """Uploads a video / Short to YouTube using the v3 Resumable Upload API with chunked transfer and progress reporting.
     Returns (video_id, youtube_url).
     """
     token = _yt_token(acc)
@@ -636,6 +645,9 @@ def youtube_upload(acc: dict, video_path: Path, title: str, description: str, ta
     }
 
     size = video_path.stat().st_size
+    if progress_cb:
+        progress_cb(1, 0, size, "Initializing YouTube upload session...")
+
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json; charset=UTF-8",
@@ -658,26 +670,77 @@ def youtube_upload(acc: dict, video_path: Path, title: str, description: str, ta
     if not upload_url:
         raise RuntimeError("YouTube did not provide upload URL in Location header.")
 
-    # Upload video content
-    with video_path.open("rb") as f:
-        file_bytes = f.read()
+    # Upload video content in chunks (multiples of 256KB, 4MB default)
+    chunk_size = 4 * 1024 * 1024
+    offset = 0
+    vid = ""
+    total_chunks = max(1, (size + chunk_size - 1) // chunk_size)
+    chunk_index = 0
 
-    u_st, _, _, u_text = _http_request(
-        upload_url,
-        method="PUT",
-        headers={"Content-Type": "video/mp4", "Content-Length": str(size)},
-        data=file_bytes,
-        timeout=1800,
-    )
-    res = _check(u_st, u_text, "Uploading video content to YouTube")
-    vid = res.get("id", "")
+    with video_path.open("rb") as f:
+        while offset < size:
+            chunk_index += 1
+            chunk_end = min(offset + chunk_size, size)
+            chunk_len = chunk_end - offset
+            f.seek(offset)
+            chunk_data = f.read(chunk_len)
+
+            mb_done = offset / (1024 * 1024)
+            mb_tot = size / (1024 * 1024)
+            pct = min(98, max(1, int((offset / size) * 100))) if size > 0 else 0
+            if progress_cb:
+                progress_cb(pct, offset, size, f"Uploading chunk {chunk_index}/{total_chunks} ({mb_done:.1f} MB / {mb_tot:.1f} MB - {pct}%)")
+
+            # Content-Range is bytes START-END/TOTAL where END is inclusive (chunk_end - 1)
+            u_st, u_headers, _, u_text = _http_request(
+                upload_url,
+                method="PUT",
+                headers={
+                    "Content-Type": "video/mp4",
+                    "Content-Length": str(chunk_len),
+                    "Content-Range": f"bytes {offset}-{chunk_end - 1}/{size}",
+                },
+                data=chunk_data,
+                timeout=300,
+            )
+
+            if u_st in (200, 201):
+                try:
+                    res = json.loads(u_text)
+                    vid = res.get("id", "")
+                except Exception:
+                    pass
+                offset = size
+                break
+            elif u_st == 308:
+                # 308 Resume Incomplete
+                rng = u_headers.get("Range") or u_headers.get("range")
+                if rng and "-" in rng:
+                    try:
+                        offset = int(rng.split("-")[1]) + 1
+                    except Exception:
+                        offset = chunk_end
+                else:
+                    offset = chunk_end
+            else:
+                raise RuntimeError(f"Uploading video chunk to YouTube failed ({u_st}): {u_text[:300]}")
+
+            mb_done = offset / (1024 * 1024)
+            pct = min(98, max(1, int((offset / size) * 100))) if size > 0 else 0
+            if progress_cb:
+                progress_cb(pct, offset, size, f"Uploaded {mb_done:.1f} MB / {mb_tot:.1f} MB ({pct}%)")
+
+    if progress_cb:
+        progress_cb(100, size, size, "Published to YouTube Shorts!")
+
     url = f"https://www.youtube.com/shorts/{vid}" if vid else ""
     return vid, url
 
 
 def facebook_upload(acc: dict, video_path: Path, title: str, description: str, is_reel: bool = True, progress_cb=None) -> tuple:
     """Uploads video or Reel to Facebook Page via Meta Graph API using chunked Resumable Upload.
-    Handles files of any size (even hundreds of megabytes) reliably without HTTP 413 errors.
+    Handles files of any size reliably without HTTP 413 or timeout errors.
+    Includes chunk retries, exponential backoff, and granular byte/progress updates.
     Returns (video_id, post_url).
     """
     token = acc.get("access_token", "")
@@ -686,8 +749,11 @@ def facebook_upload(acc: dict, video_path: Path, title: str, description: str, i
     clean_title = (title or "Clip")[:100]
     clean_desc = (description or "")[:5000]
 
-    # Phase 1: Start upload session
-    start_url = f"https://graph.facebook.com/v21.0/{page_id}/videos"
+    if progress_cb:
+        progress_cb(1, 0, size, "Starting Facebook upload session...")
+
+    # Phase 1: Start upload session on graph-video
+    start_url = f"https://graph-video.facebook.com/v21.0/{page_id}/videos"
     start_data = urllib.parse.urlencode({
         "upload_phase": "start",
         "file_size": str(size),
@@ -705,71 +771,107 @@ def facebook_upload(acc: dict, video_path: Path, title: str, description: str, i
     if not session_id:
         raise RuntimeError("Facebook did not return an upload_session_id.")
 
-    # Phase 2: Transfer chunks (4MB per chunk)
+    # Phase 2: Transfer chunks
     chunk_size = 4 * 1024 * 1024
     transfer_url = f"https://graph-video.facebook.com/v21.0/{page_id}/videos"
+    total_chunks = max(1, (size + chunk_size - 1) // chunk_size)
+    chunk_index = 0
 
     with video_path.open("rb") as f:
         while start_offset < size:
-            target_end = min(start_offset + chunk_size, size)
-            f.seek(start_offset)
-            chunk_bytes = f.read(target_end - start_offset)
-
-            boundary = "----NeonFBChunk" + secrets.token_hex(8)
-            body = bytearray()
-            def add_field(n, v):
-                body.extend(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{n}\"\r\n\r\n{v}\r\n".encode("utf-8"))
-
-            add_field("upload_phase", "transfer")
-            add_field("upload_session_id", session_id)
-            add_field("start_offset", str(start_offset))
-            add_field("access_token", token)
-            body.extend(f"--{boundary}\r\nContent-Disposition: form-data; name=\"video_file_chunk\"; filename=\"chunk.mp4\"\r\nContent-Type: application/octet-stream\r\n\r\n".encode("utf-8"))
-            body.extend(chunk_bytes)
-            body.extend(f"\r\n--{boundary}--\r\n".encode("utf-8"))
-
-            st, _, _, text = _http_request(
-                transfer_url,
-                method="POST",
-                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-                data=bytes(body),
-                timeout=300
-            )
-            res_transfer = _check(st, text, f"Uploading video chunk at offset {start_offset}")
-
-            new_start = int(res_transfer.get("start_offset", target_end))
-            if new_start <= start_offset:
-                start_offset = target_end
+            chunk_index += 1
+            if end_offset > start_offset and (end_offset - start_offset) <= 16 * 1024 * 1024:
+                target_end = min(end_offset, size)
             else:
-                start_offset = new_start
+                target_end = min(start_offset + chunk_size, size)
 
-            if progress_cb and size > 0:
-                pct = min(99, int((start_offset / size) * 100))
-                progress_cb(pct)
+            chunk_len = target_end - start_offset
+            f.seek(start_offset)
+            chunk_bytes = f.read(chunk_len)
+
+            mb_done = start_offset / (1024 * 1024)
+            mb_tot = size / (1024 * 1024)
+            pct = min(98, max(1, int((start_offset / size) * 100))) if size > 0 else 0
+            if progress_cb:
+                progress_cb(pct, start_offset, size, f"Uploading chunk {chunk_index}/{total_chunks} ({mb_done:.1f} MB / {mb_tot:.1f} MB - {pct}%)")
+
+            # Retry loop for chunk transfer
+            max_retries = 3
+            res_transfer = None
+            last_err = None
+
+            for attempt in range(1, max_retries + 1):
+                try:
+                    boundary = "----NeonFBChunk" + secrets.token_hex(8)
+                    body = bytearray()
+                    def add_field(n, v):
+                        body.extend(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{n}\"\r\n\r\n{v}\r\n".encode("utf-8"))
+
+                    add_field("upload_phase", "transfer")
+                    add_field("upload_session_id", session_id)
+                    add_field("start_offset", str(start_offset))
+                    add_field("access_token", token)
+                    body.extend(f"--{boundary}\r\nContent-Disposition: form-data; name=\"video_file_chunk\"; filename=\"chunk.mp4\"\r\nContent-Type: application/octet-stream\r\n\r\n".encode("utf-8"))
+                    body.extend(chunk_bytes)
+                    body.extend(f"\r\n--{boundary}--\r\n".encode("utf-8"))
+
+                    st, _, _, text = _http_request(
+                        transfer_url,
+                        method="POST",
+                        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+                        data=bytes(body),
+                        timeout=300
+                    )
+                    res_transfer = _check(st, text, f"Uploading video chunk at offset {start_offset}")
+                    break
+                except Exception as e:
+                    last_err = e
+                    if attempt < max_retries:
+                        time.sleep(attempt * 2)
+                    else:
+                        raise RuntimeError(f"Uploading chunk {chunk_index} failed after {max_retries} attempts: {e}") from e
+
+            if isinstance(res_transfer, dict):
+                new_start = int(res_transfer.get("start_offset", target_end))
+                end_offset = int(res_transfer.get("end_offset", 0))
+                if new_start <= start_offset:
+                    start_offset = target_end
+                else:
+                    start_offset = new_start
+            else:
+                start_offset = target_end
+
+            mb_done = start_offset / (1024 * 1024)
+            pct = min(98, max(1, int((start_offset / size) * 100))) if size > 0 else 0
+            if progress_cb:
+                progress_cb(pct, start_offset, size, f"Uploaded {mb_done:.1f} MB / {mb_tot:.1f} MB ({pct}%)")
 
     # Phase 3: Finish upload session
-    finish_url = f"https://graph.facebook.com/v21.0/{page_id}/videos"
+    if progress_cb:
+        progress_cb(99, size, size, "Finalizing and publishing on Facebook...")
+
+    finish_url = f"https://graph-video.facebook.com/v21.0/{page_id}/videos"
     finish_params = {
         "upload_phase": "finish",
         "upload_session_id": session_id,
         "title": clean_title,
         "description": clean_desc,
-        "published": "true" if is_reel else "false",
+        "published": "true",
         "access_token": token
     }
     finish_data = urllib.parse.urlencode(finish_params).encode("utf-8")
-    st, _, _, text = _http_request(finish_url, method="POST", data=finish_data, timeout=60)
+    st, _, _, text = _http_request(finish_url, method="POST", data=finish_data, timeout=300)
     _check(st, text, "Finishing Facebook Video Upload")
 
     if progress_cb:
-        progress_cb(100)
+        progress_cb(100, size, size, "Published to Facebook!")
 
     url = f"https://www.facebook.com/{page_id}/videos/{video_id}" if (video_id and page_id != "me") else f"https://www.facebook.com/{video_id}"
     return video_id, url
 
 
-def tiktok_upload(acc: dict, video_path: Path, caption: str, privacy: str = "public") -> tuple:
-    """Uploads a video to TikTok using the Content Posting API.
+def tiktok_upload(acc: dict, video_path: Path, caption: str, privacy: str = "public", progress_cb=None) -> tuple:
+    """Uploads a video to TikTok using the Content Posting API with progress reporting.
     Returns (publish_id, video_url).
     """
     token = _tt_token(acc)
@@ -780,6 +882,9 @@ def tiktok_upload(acc: dict, video_path: Path, caption: str, privacy: str = "pub
         "private": "SELF_ONLY",
     }
     priv_level = priv_map.get(privacy, "PUBLIC_TO_EVERYONE")
+
+    if progress_cb:
+        progress_cb(5, 0, size, "Initializing TikTok upload...")
 
     init_body = {
         "post_info": {
@@ -815,6 +920,9 @@ def tiktok_upload(acc: dict, video_path: Path, caption: str, privacy: str = "pub
         raise RuntimeError("TikTok did not provide upload URL.")
 
     # Step 2: Upload file
+    if progress_cb:
+        progress_cb(20, 0, size, "Uploading video content to TikTok...")
+
     with video_path.open("rb") as f:
         file_bytes = f.read()
 
@@ -832,10 +940,16 @@ def tiktok_upload(acc: dict, video_path: Path, caption: str, privacy: str = "pub
     if u_st not in (200, 201, 206):
         raise RuntimeError(f"Uploading file to TikTok failed ({u_st}): {u_text[:200]}")
 
+    if progress_cb:
+        progress_cb(65, size, size, "Uploaded. TikTok processing video...")
+
     # Step 3: Poll status
     post_url = ""
-    for _ in range(30):
+    for idx in range(30):
         time.sleep(4)
+        if progress_cb:
+            pct = min(95, 65 + idx)
+            progress_cb(pct, size, size, f"TikTok checking publish status... ({idx * 4}s)")
         s_st, _, _, s_text = _http_request(
             "https://open.tiktokapis.com/v2/post/publish/status/fetch/",
             method="POST",
@@ -853,14 +967,20 @@ def tiktok_upload(acc: dict, video_path: Path, caption: str, privacy: str = "pub
         elif status == "FAILED":
             raise RuntimeError(f"TikTok post failed: {st_data.get('fail_reason', 'unknown')}")
 
+    if progress_cb:
+        progress_cb(100, size, size, "Published to TikTok!")
+
     return publish_id, post_url
 
 
-def instagram_upload(acc: dict, video_path: Path, caption: str) -> tuple:
-    """Uploads Reel to Instagram Business/Creator account."""
+def instagram_upload(acc: dict, video_path: Path, caption: str, progress_cb=None) -> tuple:
+    """Uploads Reel to Instagram Business/Creator account with progress reporting."""
     token = acc.get("access_token", "")
     uid = acc.get("user_id", "")
     size = video_path.stat().st_size
+
+    if progress_cb:
+        progress_cb(5, 0, size, "Creating Instagram Reel container...")
 
     # Step 1: Create media container
     c_st, _, _, c_text = _http_request(
@@ -879,6 +999,9 @@ def instagram_upload(acc: dict, video_path: Path, caption: str) -> tuple:
     container_id = container.get("id")
 
     # Step 2: Upload file bytes
+    if progress_cb:
+        progress_cb(20, 0, size, "Uploading Reel binary to Instagram...")
+
     with video_path.open("rb") as f:
         file_bytes = f.read()
 
@@ -896,9 +1019,15 @@ def instagram_upload(acc: dict, video_path: Path, caption: str) -> tuple:
     if u_st not in (200, 201):
         raise RuntimeError(f"Instagram file upload failed ({u_st}): {u_text[:200]}")
 
+    if progress_cb:
+        progress_cb(60, size, size, "Video uploaded. Instagram encoding & processing Reel...")
+
     # Step 3: Wait for processing
-    for _ in range(40):
+    for idx in range(40):
         time.sleep(5)
+        if progress_cb:
+            pct = min(92, 60 + idx)
+            progress_cb(pct, size, size, f"Instagram transcoding Reel... ({idx * 5}s)")
         st_st, _, _, st_text = _http_request(
             f"https://graph.instagram.com/{container_id}?fields=status_code,status",
             headers={"Authorization": f"Bearer {token}"},
@@ -911,6 +1040,9 @@ def instagram_upload(acc: dict, video_path: Path, caption: str) -> tuple:
             raise RuntimeError(f"Instagram processing error: {st_data.get('status')}")
 
     # Step 4: Publish
+    if progress_cb:
+        progress_cb(95, size, size, "Publishing Reel to feed...")
+
     p_st, _, _, p_text = _http_request(
         f"https://graph.instagram.com/{uid}/media_publish",
         method="POST",
@@ -920,5 +1052,9 @@ def instagram_upload(acc: dict, video_path: Path, caption: str) -> tuple:
     )
     pub = _check(p_st, p_text, "Publishing Instagram Reel")
     pub_id = pub.get("id", container_id)
+
+    if progress_cb:
+        progress_cb(100, size, size, "Published to Instagram!")
+
     return pub_id, f"https://www.instagram.com/reel/{pub_id}"
 

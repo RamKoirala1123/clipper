@@ -52,6 +52,11 @@ def _mirror_to_clip(post: dict):
                 "account_name": post["account_name"],
                 "platform": post["platform"],
                 "status": post["status"],
+                "progress": post.get("progress", ""),
+                "progress_pct": post.get("progress_pct", 0),
+                "uploaded_bytes": post.get("uploaded_bytes", 0),
+                "total_bytes": post.get("total_bytes", 0),
+                "progress_detail": post.get("progress_detail", ""),
                 "url": post.get("post_url", ""),
                 "error": post.get("error"),
                 "posted_at": post.get("posted_at"),
@@ -86,14 +91,25 @@ def execute_post(p: dict):
         _save_post_update(p)
         return
 
-    video_path = DATA / f"{p['clip_id']}.mp4"
+    clean_cid = str(p.get("clip_id", "")).strip()
+    if clean_cid.endswith(".mp4"):
+        clean_cid = clean_cid[:-4]
+
+    video_path = DATA / f"{clean_cid}.mp4"
+    if not video_path.exists():
+        video_path = DATA / str(p.get("clip_id", ""))
     if not video_path.exists():
         p["status"] = "failed"
-        p["error"] = f"Video file not found: {video_path.name}"
+        p["error"] = f"Video file not found: {clean_cid}.mp4"
         _save_post_update(p)
         return
 
     p["status"] = "posting"
+    p["total_bytes"] = video_path.stat().st_size
+    p["uploaded_bytes"] = 0
+    p["progress_pct"] = 0
+    p["progress"] = "0%"
+    p["progress_detail"] = "Preparing upload..."
     _save_post_update(p)
 
     title = p.get("title") or "Clip"
@@ -102,14 +118,20 @@ def execute_post(p: dict):
     privacy = p.get("privacy") or "public"
 
     try:
-        def on_progress(pct: int):
-            p["progress"] = f"{pct}%"
+        def on_progress(pct: int, uploaded_bytes: int = 0, total_bytes: int = 0, detail: str = ""):
+            p["progress"] = f"{int(pct)}%"
+            p["progress_pct"] = int(pct)
+            if uploaded_bytes:
+                p["uploaded_bytes"] = int(uploaded_bytes)
+            if total_bytes:
+                p["total_bytes"] = int(total_bytes)
+            p["progress_detail"] = str(detail or f"Uploading... {int(pct)}%")
             _save_post_update(p)
 
         plat = acc["platform"]
         if plat == "youtube":
             remote_id, url = social_accounts.youtube_upload(
-                acc, video_path, title, desc, tags=tags, privacy=privacy
+                acc, video_path, title, desc, tags=tags, privacy=privacy, progress_cb=on_progress
             )
         elif plat == "facebook":
             remote_id, url = social_accounts.facebook_upload(
@@ -118,18 +140,21 @@ def execute_post(p: dict):
         elif plat == "tiktok":
             caption = f"{title}\n\n{desc}".strip()
             remote_id, url = social_accounts.tiktok_upload(
-                acc, video_path, caption, privacy=privacy
+                acc, video_path, caption, privacy=privacy, progress_cb=on_progress
             )
         elif plat == "instagram":
             caption = f"{title}\n\n{desc}".strip()
             remote_id, url = social_accounts.instagram_upload(
-                acc, video_path, caption
+                acc, video_path, caption, progress_cb=on_progress
             )
         else:
             raise RuntimeError(f"Platform {plat} is not supported.")
 
         p["status"] = "posted"
         p["progress"] = "100%"
+        p["progress_pct"] = 100
+        p["uploaded_bytes"] = p.get("total_bytes") or video_path.stat().st_size
+        p["progress_detail"] = "Published successfully!"
         p["posted_at"] = time.time()
         p["remote_id"] = remote_id
         p["post_url"] = url
@@ -138,6 +163,7 @@ def execute_post(p: dict):
         p["tries"] = p.get("tries", 0) + 1
         p["error"] = str(e)[-400:]
         p["status"] = "failed"
+        p["progress_detail"] = f"Failed: {str(e)[:120]}"
 
     _save_post_update(p)
 
@@ -186,6 +212,11 @@ def enqueue(clip_id: str, account_ids: list, title: str, description: str, tags:
             "tags": tags,
             "privacy": privacy,
             "status": "scheduled",
+            "progress": "0%",
+            "progress_pct": 0,
+            "uploaded_bytes": 0,
+            "total_bytes": 0,
+            "progress_detail": "Scheduled",
             "due_at": time.time(),
             "created_at": time.time(),
             "posted_at": None,

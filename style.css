@@ -228,6 +228,17 @@ details.lite summary small{color:var(--muted);margin-left:6px}
 .post-status-banner.bad{background:#35151b;border:1px solid #742533;color:#fca5a5}
 .post-status-banner.working{background:#1b2536;border:1px solid #2b4c77;color:#93c5fd}
 
+.post-progress-box{display:flex;flex-direction:column;gap:8px;padding:12px 14px;background:#0d0914;border:1px solid #302244;border-radius:10px;margin-top:10px}
+.progress-bar-wrap{height:8px;background:#20172e;border-radius:999px;overflow:hidden;border:1px solid #392850}
+.progress-bar-fill{height:100%;background:linear-gradient(90deg,var(--pink),var(--cyan),var(--lime));border-radius:999px;width:0%;transition:width .3s ease-out;box-shadow:0 0 12px #ff4ba566}
+.progress-bar-meta{display:flex;justify-content:space-between;align-items:center;font-size:11px}
+#post-progress-text{font-weight:700;color:var(--white)}
+#post-progress-sub{color:var(--cyan);font-size:11px}
+.post-row-progress{display:flex;flex-direction:column;gap:4px;width:100%;max-width:260px;margin-top:6px}
+.post-row-bar{height:5px;background:#20172e;border-radius:999px;overflow:hidden;border:1px solid #352646}
+.post-row-bar-fill{height:100%;background:linear-gradient(90deg,var(--pink),var(--cyan));border-radius:999px;width:0%;transition:width .3s}
+.post-row-detail{font-size:10px;color:var(--cyan)}
+
 .posts-list{display:flex;flex-direction:column;gap:8px;margin-top:12px}
 .post-row{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:#120d1b;border:1px solid #2b1f38;border-radius:8px;font-size:12px}
 .post-row-left{display:flex;align-items:center;gap:10px}

@@ -411,6 +411,7 @@ async function refreshSocialPosts() {
       row.className = 'post-row';
       const left = document.createElement('div');
       left.className = 'post-row-left';
+      left.style.flex = '1';
       const badge = document.createElement('span');
       badge.className = 'platform-badge plat-' + p.platform;
       badge.textContent = p.platform;
@@ -421,6 +422,24 @@ async function refreshSocialPosts() {
       toAcc.textContent = '→ ' + p.account_name;
       left.append(badge, title, toAcc);
 
+      if (p.status === 'posting') {
+        const progBox = document.createElement('div');
+        progBox.className = 'post-row-progress';
+        const bar = document.createElement('div');
+        bar.className = 'post-row-bar';
+        const fill = document.createElement('div');
+        fill.className = 'post-row-bar-fill';
+        const pct = p.progress_pct != null ? p.progress_pct : (parseInt(p.progress) || 0);
+        fill.style.width = pct + '%';
+        bar.append(fill);
+        const sub = document.createElement('span');
+        sub.className = 'post-row-detail';
+        const mbInfo = (p.uploaded_bytes && p.total_bytes) ? ` (${(p.uploaded_bytes / 1048576).toFixed(1)} MB / ${(p.total_bytes / 1048576).toFixed(1)} MB)` : '';
+        sub.textContent = (p.progress_detail || `${pct}% uploaded`) + mbInfo;
+        progBox.append(bar, sub);
+        left.append(progBox);
+      }
+
       const right = document.createElement('div');
       right.style.display = 'flex';
       right.style.alignItems = 'center';
@@ -428,7 +447,7 @@ async function refreshSocialPosts() {
 
       const pill = document.createElement('span');
       pill.className = 'post-pill ' + p.status;
-      pill.textContent = p.status;
+      pill.textContent = p.status === 'posting' ? (p.progress || 'posting') : p.status;
       right.append(pill);
 
       if (p.post_url) {
@@ -461,6 +480,12 @@ async function refreshSocialPosts() {
       row.append(left, right);
       host.append(row);
     });
+
+    // Auto-refresh when posts are actively uploading
+    if (posts.some(p => p.status === 'posting' || p.status === 'scheduled')) {
+      if (window._postPollTimer) clearTimeout(window._postPollTimer);
+      window._postPollTimer = setTimeout(refreshSocialPosts, 2000);
+    }
   } catch (e) {
     status('Could not load posts: ' + e.message);
   }
@@ -485,6 +510,12 @@ async function openPostDialog(clipId, clipData) {
 
   $('post-dlg-status').hidden = true;
   $('post-dlg-status').className = 'post-status-banner';
+
+  const progBox = $('post-progress-box');
+  if (progBox) progBox.hidden = true;
+  if ($('post-progress-fill')) $('post-progress-fill').style.width = '0%';
+  if ($('post-progress-text')) $('post-progress-text').textContent = 'Uploading... 0%';
+  if ($('post-progress-sub')) $('post-progress-sub').textContent = '0 MB / 0 MB';
 
   try {
     socialAccounts = await request('/api/accounts');
@@ -555,6 +586,12 @@ async function submitPost(isNow) {
   banner.className = 'post-status-banner working';
   banner.textContent = isNow ? 'Uploading to ' + checked.length + ' account(s)...' : 'Adding to queue...';
 
+  const progBox = $('post-progress-box');
+  if (progBox) progBox.hidden = !isNow;
+  if ($('post-progress-fill')) $('post-progress-fill').style.width = '0%';
+  if ($('post-progress-text')) $('post-progress-text').textContent = 'Preparing upload... 0%';
+  if ($('post-progress-sub')) $('post-progress-sub').textContent = 'Connecting...';
+
   $('post-now-btn').disabled = true;
   $('post-queue-btn').disabled = true;
 
@@ -567,8 +604,8 @@ async function submitPost(isNow) {
       return;
     }
 
-    // Poll status of this clip's posts (up to 6 minutes for large files)
-    for (let i = 0; i < 180; i++) {
+    // Poll status of this clip's posts (up to 30 minutes for large video uploads)
+    for (let i = 0; i < 900; i++) {
       await sleep(2000);
       const posts = await request('/api/posts?clip_id=' + activePostClip);
       const myPosts = posts.filter(p => checked.includes(p.account_id));
@@ -578,14 +615,29 @@ async function submitPost(isNow) {
       const allDone = myPosts.every(p => p.status === 'posted' || p.status === 'failed');
 
       if (anyPosting) {
-        const prog = myPosts.map(p => p.progress).filter(Boolean)[0];
-        banner.textContent = 'Uploading to ' + checked.length + ' account(s)...' + (prog ? ' (' + prog + ')' : '');
+        const active = myPosts.find(p => p.status === 'posting') || myPosts[0];
+        const pct = active.progress_pct != null ? active.progress_pct : (parseInt(active.progress) || 0);
+        if ($('post-progress-fill')) $('post-progress-fill').style.width = pct + '%';
+        if ($('post-progress-text')) $('post-progress-text').textContent = active.progress_detail || ('Uploading... ' + (active.progress || '0%'));
+        if ($('post-progress-sub')) {
+          if (active.uploaded_bytes && active.total_bytes) {
+            const mbUp = (active.uploaded_bytes / 1048576).toFixed(1);
+            const mbTot = (active.total_bytes / 1048576).toFixed(1);
+            $('post-progress-sub').textContent = `${mbUp} MB / ${mbTot} MB (${pct}%)`;
+          } else {
+            $('post-progress-sub').textContent = active.progress || '';
+          }
+        }
+        banner.textContent = 'Uploading to ' + checked.length + ' account(s)...' + (active.progress ? ' (' + active.progress + ')' : '');
       }
 
       if (allDone || !anyPosting) {
         const successes = myPosts.filter(p => p.status === 'posted');
         const fails = myPosts.filter(p => p.status === 'failed');
         if (successes.length && !fails.length) {
+          if ($('post-progress-fill')) $('post-progress-fill').style.width = '100%';
+          if ($('post-progress-text')) $('post-progress-text').textContent = 'Upload complete (100%)';
+          if ($('post-progress-sub')) $('post-progress-sub').textContent = 'Published successfully!';
           banner.className = 'post-status-banner ok';
           const linksHtml = successes.filter(p => p.post_url).map(p => '<a href="' + p.post_url + '" target="_blank" rel="noopener" style="color:var(--lime);font-weight:bold;margin-left:6px">' + p.platform + ' link ↗</a>').join(' ');
           banner.innerHTML = 'Successfully posted to ' + successes.length + ' platform(s)! ' + linksHtml;
